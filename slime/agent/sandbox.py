@@ -17,6 +17,9 @@ import time
 from pathlib import Path
 from typing import Protocol, runtime_checkable
 
+from pyromind_sdk import PyroMindAsyncAPIClient
+from pyromind_sdk.client.models import SandboxResponse
+
 logger = logging.getLogger(__name__)
 
 
@@ -382,3 +385,219 @@ async def ensure_agent_user(sb: Sandbox, workdir: str) -> None:
         check=True,
         timeout=60,
     )
+
+
+class PyromindSandbox:
+    """Async context manager around PyroMind Platform Async Sandbox API.
+
+    Implements the slime Sandbox Protocol using pyromind-sdk.
+    """
+
+    default_cpu = "4"
+    default_memory = "8Gi"
+    default_gpu = "0"
+    default_gpu_card = None
+
+    def __init__(
+        self,
+        image: str,
+        *,
+        timeout: int | None = None,
+        cpu: str | None = None,
+        memory: str | None = None,
+        gpu: str | None = None,
+        gpu_card: str | None = None,
+        sandbox_type: str = "custom",
+        name: str | None = None,
+        volume_mounts: list | None = None,
+        port_mappings: list | None = None,
+        api_key: str | None = None,
+        base_url: str | None = None,
+    ):
+        self.image = image
+        self.timeout = timeout
+        self.cpu = cpu or os.environ.get("PYROMIND_SANDBOX_CPU", self.default_cpu)
+        self.memory = memory or os.environ.get("PYROMIND_SANDBOX_MEMORY", self.default_memory)
+        self.gpu = gpu if gpu is not None else os.environ.get("PYROMIND_SANDBOX_GPU", self.default_gpu)
+        self.gpu_card = gpu_card or os.environ.get("PYROMIND_SANDBOX_GPU_CARD", self.default_gpu_card)
+        self.sandbox_type = sandbox_type
+        self.name = name or f"slime-sandbox-{random.randint(0, 0xffffff):06x}"
+        self.volume_mounts = volume_mounts
+        self.port_mappings = port_mappings
+        self.api_key = api_key
+        self.base_url = base_url
+        self._client: PyroMindAsyncAPIClient | None = None
+        self._sandbox: SandboxResponse | None = None
+        self.sandbox_id: str = ""
+
+    async def __aenter__(self) -> PyromindSandbox:
+        from pyromind_sdk import PyroMindAsyncAPIClient
+        from pyromind_sdk.client.models import PortMapping, ResourceConfig, SandboxRequest, SandboxType, VolumeMount
+
+        self._client = PyroMindAsyncAPIClient(api_key=self.api_key, base_url=self.base_url)
+
+        mounts = None
+        if self.volume_mounts:
+            mounts = [VolumeMount(**m) if isinstance(m, dict) else m for m in self.volume_mounts]
+
+        ports = None
+        if self.port_mappings:
+            ports = [PortMapping(**p) if isinstance(p, dict) else p for p in self.port_mappings]
+
+        request = SandboxRequest(
+            sandbox_type=SandboxType(self.sandbox_type),
+            name=self.name,
+            image=self.image,
+            resources=ResourceConfig(
+                cpu=self.cpu,
+                memory=self.memory,
+                gpu=self.gpu,
+                gpu_card=self.gpu_card,
+            ),
+            volume_mounts=mounts,
+            port_mappings=ports,
+        )
+
+        self._sandbox = await self._client.sandboxes.create_and_wait(
+            request,
+            target_status="running",
+            timeout=self.timeout or 300,
+        )
+        self.sandbox_id = self._sandbox.id
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb) -> None:
+        try:
+            if self._client is not None and self.sandbox_id:
+                await self._client.sandboxes.pause(self.sandbox_id)
+                await self._client.sandboxes.wait_for_sandbox_status(self.sandbox_id, "paused", timeout=60)
+                await self._client.sandboxes.delete(self.sandbox_id)
+        except Exception as e:
+            logger.warning("[agent.sandbox.pyromind] kill %s failed: %s", self.sandbox_id[:8], e)
+        finally:
+            if self._client is not None:
+                try:
+                    await self._client.close()
+                except Exception:
+                    pass
+
+    async def exec(
+        self,
+        cmd: str,
+        *,
+        user: str = "root",
+        env: dict[str, str] | None = None,
+        timeout: int = 120,
+        check: bool = False,
+        idempotent: bool = True,
+    ) -> ExecResult:
+        """Execute a shell command in the sandbox.
+
+        Note: user/env parameters are accepted but ignored by Pyromind backend
+        since Pyromind SWE-bench sandboxes execute as the container default user.
+        """
+        from pyromind_sdk import PyroMindAPIError
+
+        try:
+            # Prepend environment variables if provided
+            full_cmd = cmd
+            if env:
+                env_prefix = " ".join(f"{k}={v}" for k, v in env.items()) + " "
+                full_cmd = env_prefix + full_cmd
+
+            res = await self._client.sandboxes.exec_command(
+                self.sandbox_id,
+                command=full_cmd,
+                timeout=timeout,
+            )
+            exit_code = res.returncode
+            output = res.output or ""
+            stderr = res.exception_info or ""
+            if check and exit_code != 0:
+                raise RuntimeError(
+                    f"Pyromind sandbox exec failed (exit={exit_code}): {cmd[:120]}\n{(stderr or output)[:400]}"
+                )
+            return exit_code, output, stderr
+        except PyroMindAPIError as e:
+            if check:
+                raise RuntimeError(f"Pyromind API error: {e.message}") from None
+            return -1, "", str(e)
+
+    async def write_file(self, sandbox_path: str, content: FileContent, *, user: str = "root") -> None:
+        """Write a file to the sandbox using base64 encoding over exec."""
+        import base64
+
+        if isinstance(content, Path):
+            with open(content, "rb") as fp:
+                content_bytes = fp.read()
+        elif isinstance(content, bytes):
+            content_bytes = content
+        else:
+            content_bytes = content.encode("utf-8")
+
+        b64 = base64.b64encode(content_bytes).decode("ascii")
+        cmd = f"mkdir -p $(dirname {sandbox_path}) && echo '{b64}' | base64 -d > {sandbox_path}"
+        # User parameter is noted but execution permissions handled at container level
+        ec, out, err = await self.exec(cmd, user=user, check=True)
+        if ec != 0:
+            raise RuntimeError(f"Failed to write file {sandbox_path}: {err}")
+
+    async def read_file(self, sandbox_path: str, *, user: str = "root") -> str:
+        """Read a file from the sandbox using base64 encoding over exec."""
+        import base64
+
+        ec, out, err = await self.exec(f"cat {sandbox_path} 2>/dev/null | base64 -w 0", user=user)
+        if ec != 0 or not out.strip():
+            return ""
+        try:
+            decoded = base64.b64decode(out.strip()).decode("utf-8")
+            return decoded
+        except Exception:
+            # Fallback: return raw output if base64 decode fails
+            return out
+
+
+_SANDBOX_BACKENDS: dict[str, type] = {
+    "e2b": E2BSandbox,
+    "pyromind": PyromindSandbox,
+}
+
+
+def _parse_json_env(key: str) -> list | None:
+    """Parse a JSON list from an env var, returning None if unset or empty."""
+    raw = os.environ.get(key, "").strip()
+    if not raw:
+        return None
+    import json
+
+    return json.loads(raw)
+
+
+def create_sandbox(image: str) -> PyromindSandbox | E2BSandbox:
+    """Create a sandbox instance configured by environment variables.
+
+    ``SANDBOX_BACKEND`` selects the backend (``e2b`` or ``pyromind``,
+    default ``e2b``).  For the Pyromind backend the following env vars
+    are also honoured:
+
+    ==========================  =====================================
+    ``PYROMIND_SANDBOX_CPU``       CPU cores (default ``"4"``)
+    ``PYROMIND_SANDBOX_MEMORY``    Memory limit (default ``"8Gi"``)
+    ``PYROMIND_SANDBOX_GPU``       GPU count (default ``"0"``)
+    ``PYROMIND_SANDBOX_GPU_CARD``  GPU card type
+    ``PYROMIND_SANDBOX_VOLUMES``   JSON list of volume mounts
+    ``PYROMIND_SANDBOX_PORTS``     JSON list of port mappings
+    ==========================  =====================================
+    """
+    backend = os.environ.get("SANDBOX_BACKEND", "e2b")
+    if backend not in _SANDBOX_BACKENDS:
+        raise ValueError(f"SANDBOX_BACKEND={backend!r} not supported; " f"choose from {sorted(_SANDBOX_BACKENDS)}")
+
+    if backend == "pyromind":
+        return PyromindSandbox(
+            image,
+            volume_mounts=_parse_json_env("PYROMIND_SANDBOX_VOLUMES"),
+            port_mappings=_parse_json_env("PYROMIND_SANDBOX_PORTS"),
+        )
+
+    return E2BSandbox(image)
