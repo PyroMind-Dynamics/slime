@@ -13,7 +13,7 @@ openai
 openai-agents
 pillow
 pylatexenc
-pyromind-sdk==0.1.8.dev1
+pyromind-sdk>=0.1.8rc1
 pyyaml
 qwen_vl_utils # for VLM
 ray[default]
@@ -25,4 +25,3 @@ transformers
 wandb
 xxhash  # disk delta weight sync (checksum + codec)
 zstandard
-#pyromind-sdk>=0.1.8rc1

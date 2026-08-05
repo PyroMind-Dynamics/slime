@@ -494,9 +494,9 @@ class PyromindSandbox:
         """Execute a shell command in the sandbox.
 
         Note: user/env parameters are accepted but ignored by Pyromind backend
-        since Pyromind SWE-bench sandboxes execute as the container default user.
+        since Pyromind sandboxes execute as the container default user.
         """
-        from pyromind_sdk import PyroMindAPIError
+        from pyromind_sdk import PyroMindAsyncAPIError
 
         try:
             # Prepend environment variables if provided
@@ -518,14 +518,14 @@ class PyromindSandbox:
                     f"Pyromind sandbox exec failed (exit={exit_code}): {cmd[:120]}\n{(stderr or output)[:400]}"
                 )
             return exit_code, output, stderr
-        except PyroMindAPIError as e:
+        except PyroMindAsyncAPIError as e:
             if check:
                 raise RuntimeError(f"Pyromind API error: {e.message}") from None
             return -1, "", str(e)
 
     async def write_file(self, sandbox_path: str, content: FileContent, *, user: str = "root") -> None:
-        """Write a file to the sandbox using base64 encoding over exec."""
-        import base64
+        """Write a file to the sandbox via the SDK's native chunked upload."""
+        from pyromind_sdk import PyroMindAsyncAPIError
 
         if isinstance(content, Path):
             with open(content, "rb") as fp:
@@ -535,26 +535,33 @@ class PyromindSandbox:
         else:
             content_bytes = content.encode("utf-8")
 
-        b64 = base64.b64encode(content_bytes).decode("ascii")
-        cmd = f"mkdir -p $(dirname {sandbox_path}) && echo '{b64}' | base64 -d > {sandbox_path}"
         # User parameter is noted but execution permissions handled at container level
-        ec, out, err = await self.exec(cmd, user=user, check=True)
-        if ec != 0:
-            raise RuntimeError(f"Failed to write file {sandbox_path}: {err}")
+        try:
+            await self._client.sandboxes.write_file(
+                self.sandbox_id,
+                sandbox_path,
+                content_bytes,
+            )
+        except PyroMindAsyncAPIError as e:
+            raise RuntimeError(f"Failed to write file {sandbox_path}: {e.message}") from None
 
     async def read_file(self, sandbox_path: str, *, user: str = "root") -> str:
-        """Read a file from the sandbox using base64 encoding over exec."""
-        import base64
+        """Read a file from the sandbox via the SDK's native byte stream."""
+        from pyromind_sdk import PyroMindAsyncAPIError
 
-        ec, out, err = await self.exec(f"cat {sandbox_path} 2>/dev/null | base64 -w 0", user=user)
-        if ec != 0 or not out.strip():
+        try:
+            data = await self._client.sandboxes.read_file(self.sandbox_id, sandbox_path)
+        except PyroMindAsyncAPIError as e:
+            # Match the legacy "missing file -> empty string" contract.
+            if getattr(e, "status_code", None) == 404:
+                return ""
+            raise RuntimeError(f"Failed to read file {sandbox_path}: {e.message}") from None
+        if not data:
             return ""
         try:
-            decoded = base64.b64decode(out.strip()).decode("utf-8")
-            return decoded
-        except Exception:
-            # Fallback: return raw output if base64 decode fails
-            return out
+            return data.decode("utf-8")
+        except UnicodeDecodeError:
+            return data.decode("utf-8", errors="replace")
 
 
 _SANDBOX_BACKENDS: dict[str, type] = {
